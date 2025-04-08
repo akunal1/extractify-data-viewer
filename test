@@ -1,0 +1,180 @@
+import requests
+import time
+import argparse
+import xml.etree.ElementTree as ET
+import os
+from datetime import datetime
+from bs4 import BeautifulSoup
+
+def establish_session(qualys_base_url, username, password):
+    """Create an authenticated session by logging in through the web interface"""
+    session = requests.Session()
+    
+    # First, get the login page to retrieve any CSRF tokens or cookies
+    login_url = f"{qualys_base_url}/portal-front/auth/login"
+    response = session.get(login_url)
+    
+    # Find any form fields needed for login (like CSRF tokens)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    login_form = soup.find('form')
+    
+    # Prepare login data
+    login_data = {
+        'username': username,
+        'password': password,
+        'action': 'login'
+    }
+    
+    # Add any hidden fields from the form
+    if login_form:
+        for input_field in login_form.find_all('input', type='hidden'):
+            if input_field.get('name') and input_field.get('value'):
+                login_data[input_field['name']] = input_field['value']
+    
+    # Submit login form
+    response = session.post(login_url, data=login_data, allow_redirects=True)
+    
+    # Check if login was successful
+    if "Log Out" in response.text or "My Dashboard" in response.text:
+        print("Login successful")
+        return session
+    else:
+        print("Login failed. Check credentials or login page structure.")
+        return None
+
+def extract_api_url(qualys_base_url):
+    """Extract API URL from base URL"""
+    # Usually the API URL is like https://qualysapi.qualys.com
+    # If base URL is https://qualysguard.qualys.com, API URL is https://qualysapi.qualys.com
+    if "qualysguard" in qualys_base_url:
+        return qualys_base_url.replace("qualysguard", "qualysapi")
+    else:
+        return qualys_base_url
+
+def launch_report(api_url, report_id, session):
+    """Launch a report and get the report ID"""
+    launch_url = f"{api_url}/api/2.0/fo/report/?action=launch&id={report_id}"
+    response = session.post(launch_url, verify=True)
+    
+    if response.status_code != 200:
+        print(f"Error launching report: {response.text}")
+        return None
+    
+    try:
+        # Parse XML response to get the report ID
+        root = ET.fromstring(response.text)
+        report_id = root.find('.//VALUE').text
+        print(f"Report launched with ID: {report_id}")
+        return report_id
+    except Exception as e:
+        print(f"Error parsing response: {e}")
+        print(f"Response content: {response.text[:500]}...")  # Print first 500 chars
+        return None
+
+def check_report_status(api_url, report_id, session):
+    """Check the status of the report"""
+    status_url = f"{api_url}/api/2.0/fo/report/?action=list&id={report_id}"
+    
+    while True:
+        response = session.get(status_url, verify=True)
+        
+        if response.status_code != 200:
+            print(f"Error checking report status: {response.text}")
+            return False
+        
+        try:
+            root = ET.fromstring(response.text)
+            status = root.find('.//STATE').text
+            
+            if status == "Finished":
+                print("Report is ready for download")
+                return True
+            elif status in ["Running", "Submitted"]:
+                print(f"Report status: {status}. Waiting 10 seconds...")
+                time.sleep(10)
+            else:
+                print(f"Report failed with status: {status}")
+                return False
+        except Exception as e:
+            print(f"Error parsing response: {e}")
+            print(f"Response content: {response.text[:500]}...")  # Print first 500 chars
+            return False
+
+def download_report(api_url, report_id, session, output_dir):
+    """Download the report"""
+    download_url = f"{api_url}/api/2.0/fo/report/?action=fetch&id={report_id}"
+    response = session.get(download_url, verify=True, stream=True)
+    
+    if response.status_code != 200:
+        print(f"Error downloading report: {response.text[:500]}...")  # Print first 500 chars
+        return False
+    
+    # Check if we got HTML instead of the expected report format
+    content_type = response.headers.get('Content-Type', '')
+    if 'text/html' in content_type and '<html' in response.text[:100]:
+        print("Received HTML content instead of report. Authentication may have failed.")
+        print(f"Response begins with: {response.text[:500]}...")
+        return False
+    
+    # Get filename from content-disposition header or use default
+    filename = None
+    if 'Content-Disposition' in response.headers:
+        content_disp = response.headers['Content-Disposition']
+        if 'filename=' in content_disp:
+            filename = content_disp.split('filename=')[1].strip('"\'')
+    
+    if not filename:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"qualys_report_{report_id}_{timestamp}.csv"
+    
+    file_path = os.path.join(output_dir, filename)
+    
+    with open(file_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+    
+    print(f"Report downloaded successfully to {file_path}")
+    return True
+
+def main():
+    parser = argparse.ArgumentParser(description='Download a Qualys report')
+    parser.add_argument('--username', required=True, help='Qualys username')
+    parser.add_argument('--password', required=True, help='Qualys password')
+    parser.add_argument('--report_id', required=True, help='Report template ID')
+    parser.add_argument('--qualys_url', required=True, help='Qualys base URL (e.g., https://qualysguard.qualys.com)')
+    parser.add_argument('--output_dir', default='.', help='Output directory for the report')
+    
+    args = parser.parse_args()
+    
+    # Establish an authenticated session
+    session = establish_session(args.qualys_url, args.username, args.password)
+    if not session:
+        return
+    
+    # Determine API URL
+    api_url = extract_api_url(args.qualys_url)
+    
+    # Launch the report
+    report_id = launch_report(api_url, args.report_id, session)
+    if not report_id:
+        return
+    
+    # Check report status
+    if check_report_status(api_url, report_id, session):
+        # Download the report
+        download_report(api_url, report_id, session, args.output_dir)
+    
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+-------
+pip install requests beautifulsoup4
+python download_qualys_report.py --username your_username --password your_password --report_id your_report_template_id --qualys_url https://qualysguard.qualys.com --output_dir /path/to/save/reports
+
+------
